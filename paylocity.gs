@@ -1,45 +1,44 @@
-/* --------------------------------------------------------------------------
-   CONFIG –‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑ */
-
-const EXPORT_FOLDER_ID = '1cCYP1UftlfEd-YlAiL7Gg9uD2geChGPT';          // ← set once
-const TIMESHEET_LIST_ID = '1HAHc8GsxzmsSYtuC42OGyHFMGKxlU6MjpI3yTRFBfnw';
+const EXPORT_FOLDER_ID = '1cCYP1UftlfEd-YlAiL7Gg9uD2geChGPT'; // <- set once
+const EMPLOYEE_REGISTRY_ID = '1HAHc8GsxzmsSYtuC42OGyHFMGKxlU6MjpI3yTRFBfnw';
 const TIMESHEET_LIST_TAB = 'Current';
-const LIST_COL_HEADER = 'Current Timesheet';                      // exact header text
+const LIST_COL_HEADER = 'Current Timesheet';  // exact header text
 
-/* --------------------------------------------------------------------------
-   ENTRY POINT
-   -------------------------------------------------------------------------- */
+/** Main method. 
+ *  Executes script across all timesheets found in the employee-registry,
+ *  and dumps output file into the EXPORT_FOLDER_ID
+ */
 function exportAllTimesheets() {
-  // 1. Fetch the list of timesheet URLs / IDs
+
+  // Fetch the list of timesheet URLs / IDs
   const links = getTimesheetLinks();
 
-  // 2. Cache of already‑opened Paylocity export files this run
-  const exportCache = new Map();   // key = fileName, value = {ss, sheet}
+  // Cache of already‑opened Paylocity export files this run
+  const exportCache = new Map(); // key = fileName, value = {ss, sheet}
 
-  // 3. Process each timesheet
+  // Process each timesheet
   links.forEach(link => {
     try {
       const rowsObj = extractPriorPayPeriodRows(link.timesheetId, link.personName);
-      if (rowsObj.rows.length === 0) return;                 // nothing to write
+      if (rowsObj.rows.length === 0) return; // nothing to write
 
       const target = getPaylocitySheet(rowsObj.periodEndDate, exportCache);
       appendRows(target.sheet, rowsObj.rows);
 
     } catch (err) {
-      Logger.log('✖ Error processing %s → %s', link.timesheetId, err);
+      Logger.log('✖ Error processing %s -> %s', link.timesheetId, err);
     }
   });
 }
 
 /* --------------------------------------------------------------------------
-   HELPERS
+   HELPER FUNCTIONS
    -------------------------------------------------------------------------- */
 
 /**
- * Read master sheet → return [{timesheetId, personName}, …]
+ * Read master sheet -> return [{timesheetId, personName}, …]
  */
 function getTimesheetLinks() {
-  const listSS = SpreadsheetApp.openById(TIMESHEET_LIST_ID);
+  const listSS = SpreadsheetApp.openById(EMPLOYEE_REGISTRY_ID);
   const sheet = listSS.getSheetByName(TIMESHEET_LIST_TAB);
 
   const headerRow = sheet.getRange(2, 1, 1, sheet.getLastColumn()).getValues()[0];  // row 2
@@ -49,15 +48,15 @@ function getTimesheetLinks() {
   const colIdx = headerRow.findIndex(h =>
     String(h).trim().toUpperCase() === LIST_COL_HEADER.toUpperCase());
   if (colIdx === -1)
-    throw new Error(`Column "${LIST_COL_HEADER}" not found in row 2.`);
+    throw new Error(`Column "${LIST_COL_HEADER}" not found in row 2.`);
 
   // get all values from row 4 downward in that column
-  const numRows = sheet.getLastRow() - 3;                 // rows 4…end
+  const numRows = sheet.getLastRow() - 3; // rows 4…end
   if (numRows <= 0) return [];
 
   const colRange = sheet.getRange(4, colIdx + 1, numRows, 1);
-  const colValues = colRange.getValues();                // plain text
-  const colRichTxt = colRange.getRichTextValues();        // to capture embedded links
+  const colValues = colRange.getValues();  // plain text
+  const colRichTxt = colRange.getRichTextValues(); // capture embedded links
 
   const links = [];
   for (let i = 0; i < numRows; i++) {
@@ -65,7 +64,7 @@ function getTimesheetLinks() {
     const url = rich?.getLinkUrl() || String(colValues[i][0]).trim();
     if (!url) continue;
 
-    const idMatch = url.match(/[-\w]{25,}/);              // extract spreadsheet ID
+    const idMatch = url.match(/[-\w]{25,}/); // extract spreadsheet ID
     if (idMatch) links.push({ timesheetId: idMatch[0] });
   }
   return links;
@@ -76,39 +75,39 @@ function getTimesheetLinks() {
  * Rows exclude header; ready to append.
  */
 function extractPriorPayPeriodRows(timesheetId) {
-  const ss    = SpreadsheetApp.openById(timesheetId);
+  const ss = SpreadsheetApp.openById(timesheetId);
   const sheet = ss.getSheets()[0];
 
   // get both raw and display so we keep leading zeros
-  const range   = sheet.getDataRange();
-  const data    = range.getValues();
+  const range = sheet.getDataRange();
+  const data = range.getValues();
   const display = range.getDisplayValues();
 
   /* ---- locate project columns ---- */
   const PROJ_NUM_ROW = 0, TASK_NUM_ROW = 1, WORK_TYPE_ROW = 2, RES_NUM_ROW = 3;
-  const skipLabels   = ['Total','Holiday','Overhead','Reviewer'];
-  const projectCols  = [];
+  const skipLabels = ['Total', 'Holiday', 'Overhead', 'Reviewer'];
+  const projectCols = [];
 
   for (let c = 1; c < data[0].length; c++) {
     const projNumDisp = display[PROJ_NUM_ROW][c];
-    const workType    = String(display[WORK_TYPE_ROW][c]).trim();
+    const workType = String(display[WORK_TYPE_ROW][c]).trim();
 
     if (skipLabels.includes(String(display[4][c]).trim())) continue;
 
-    if (projNumDisp || ['PTO (used)','PTU (used)','MBE'].includes(workType)) {
+    if (projNumDisp || ['PTO (used)', 'PTU (used)', 'MBE'].includes(workType)) {
       projectCols.push({
         col: c,
-        projNumText: projNumDisp || '',          // always text, keeps 0‑padding
+        projNumText: projNumDisp || '', // always text (to keeps 0‑padding)
         taskNum: display[TASK_NUM_ROW][c],
         workType,
         personnelCode: display[RES_NUM_ROW][c],
       });
     }
   }
-  if (!projectCols.length) return { periodEndDate:null, rows:[] };
+  if (!projectCols.length) return { periodEndDate: null, rows: [] };
 
   /* ---- completed END PERIOD range ---- */
-  const today   = new Date();
+  const today = new Date();
   const endRows = [];
   data.forEach((row, idx) => {
     if (String(row[0]).toUpperCase().trim() === 'END PERIOD') {
@@ -116,17 +115,17 @@ function extractPriorPayPeriodRows(timesheetId) {
       if (prevDate instanceof Date && prevDate <= today) endRows.push({ idx, prevDate });
     }
   });
-  if (endRows.length < 2) return { periodEndDate:null, rows:[] };
+  if (endRows.length < 2) return { periodEndDate: null, rows: [] };
 
-  const lastEnd   = endRows[endRows.length - 1].idx;
-  const prevEnd   = endRows[endRows.length - 2].idx;
+  const lastEnd = endRows[endRows.length - 1].idx;
+  const prevEnd = endRows[endRows.length - 2].idx;
   const firstData = prevEnd + 1;
-  const lastData  = lastEnd - 1;
+  const lastData = lastEnd - 1;
   const periodEndDate = data[lastData][0];
 
   /* ---- build export rows ---- */
   const [last, first] = ss.getName().split('_')[0].split('-');
-  const personName    = `${last}, ${first}`;
+  const personName = `${last}, ${first}`;
 
   const rows = [];
   for (let r = firstData; r <= lastData; r++) {
@@ -134,16 +133,16 @@ function extractPriorPayPeriodRows(timesheetId) {
     if (!(dateVal instanceof Date)) continue;
 
     projectCols.forEach(p => {
-      // ✔ keep minus sign, decimal; remove other junk
+      // keep minus sign, decimal; remove other junk
       const numStr = String(data[r][p.col]).replace(/[^0-9.\-]/g, '');
-      const hrs    = parseFloat(numStr);
-      if (!isNaN(hrs) && hrs > 0) {                // skips zero or negative PTO/MBE
+      const hrs = parseFloat(numStr);
+      if (!isNaN(hrs) && hrs > 0) {// skip zero or negative PTO/MBE
         rows.push([
           dateVal,
           p.personnelCode,
           personName,
           hrs,
-          "'" + p.projNumText,                     // leading apostrophe → force text
+          "'" + p.projNumText, // add a leading apostrophe to force text output
           p.taskNum,
           p.workType,
         ]);
