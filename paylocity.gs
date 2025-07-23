@@ -1,111 +1,200 @@
-function exportPriorPayPeriod () {
-  const ss    = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getSheets()[0];
-  const data  = sheet.getDataRange().getValues();          // entire sheet
+/* --------------------------------------------------------------------------
+   CONFIG –‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑ */
 
-  // ───── 1. Identify project columns ────────────────────────────────────────────
+const EXPORT_FOLDER_ID = '1cCYP1UftlfEd-YlAiL7Gg9uD2geChGPT';          // ← set once
+const TIMESHEET_LIST_ID = '1HAHc8GsxzmsSYtuC42OGyHFMGKxlU6MjpI3yTRFBfnw';
+const TIMESHEET_LIST_TAB = 'Current';
+const LIST_COL_HEADER = 'Current Timesheet';                      // exact header text
+
+/* --------------------------------------------------------------------------
+   ENTRY POINT
+   -------------------------------------------------------------------------- */
+function exportAllTimesheets() {
+  // 1. Fetch the list of timesheet URLs / IDs
+  const links = getTimesheetLinks();
+
+  // 2. Cache of already‑opened Paylocity export files this run
+  const exportCache = new Map();   // key = fileName, value = {ss, sheet}
+
+  // 3. Process each timesheet
+  links.forEach(link => {
+    try {
+      const rowsObj = extractPriorPayPeriodRows(link.timesheetId, link.personName);
+      if (rowsObj.rows.length === 0) return;                 // nothing to write
+
+      const target = getPaylocitySheet(rowsObj.periodEndDate, exportCache);
+      appendRows(target.sheet, rowsObj.rows);
+
+    } catch (err) {
+      Logger.log('✖ Error processing %s → %s', link.timesheetId, err);
+    }
+  });
+}
+
+/* --------------------------------------------------------------------------
+   HELPERS
+   -------------------------------------------------------------------------- */
+
+/**
+ * Read master sheet → return [{timesheetId, personName}, …]
+ */
+function getTimesheetLinks() {
+  const listSS = SpreadsheetApp.openById(TIMESHEET_LIST_ID);
+  const sheet = listSS.getSheetByName(TIMESHEET_LIST_TAB);
+
+  const headerRow = sheet.getRange(2, 1, 1, sheet.getLastColumn()).getValues()[0];  // row 2
+  const richRow = sheet.getRange(2, 1, 1, sheet.getLastColumn()).getRichTextValues()[0];
+
+  // find “Current Timesheet” column (AN)
+  const colIdx = headerRow.findIndex(h =>
+    String(h).trim().toUpperCase() === LIST_COL_HEADER.toUpperCase());
+  if (colIdx === -1)
+    throw new Error(`Column "${LIST_COL_HEADER}" not found in row 2.`);
+
+  // get all values from row 4 downward in that column
+  const numRows = sheet.getLastRow() - 3;                 // rows 4…end
+  if (numRows <= 0) return [];
+
+  const colRange = sheet.getRange(4, colIdx + 1, numRows, 1);
+  const colValues = colRange.getValues();                // plain text
+  const colRichTxt = colRange.getRichTextValues();        // to capture embedded links
+
+  const links = [];
+  for (let i = 0; i < numRows; i++) {
+    const rich = colRichTxt[i][0];
+    const url = rich?.getLinkUrl() || String(colValues[i][0]).trim();
+    if (!url) continue;
+
+    const idMatch = url.match(/[-\w]{25,}/);              // extract spreadsheet ID
+    if (idMatch) links.push({ timesheetId: idMatch[0] });
+  }
+  return links;
+}
+
+/**
+ * Open a timesheet → return {periodEndDate:Date, rows:Array<Array>}
+ * Rows exclude header; ready to append.
+ */
+function extractPriorPayPeriodRows(timesheetId) {
+  const ss    = SpreadsheetApp.openById(timesheetId);
+  const sheet = ss.getSheets()[0];
+
+  // get both raw and display so we keep leading zeros
+  const range   = sheet.getDataRange();
+  const data    = range.getValues();
+  const display = range.getDisplayValues();
+
+  /* ---- locate project columns ---- */
   const PROJ_NUM_ROW = 0, TASK_NUM_ROW = 1, WORK_TYPE_ROW = 2, RES_NUM_ROW = 3;
+  const skipLabels   = ['Total','Holiday','Overhead','Reviewer'];
   const projectCols  = [];
 
-  for (let c = 1; c < data[PROJ_NUM_ROW].length; c++) {
-    const projNum = data[PROJ_NUM_ROW][c];
-    if (!projNum) break;                                   // stop at first blank cell
+  for (let c = 1; c < data[0].length; c++) {
+    const projNumDisp = display[PROJ_NUM_ROW][c];
+    const workType    = String(display[WORK_TYPE_ROW][c]).trim();
 
-    // (optional) skip “totals” columns
-    if (['Total', 'Holiday', 'Overhead', 'Reviewer'].includes(String(data[4][c])))
-      continue;
+    if (skipLabels.includes(String(display[4][c]).trim())) continue;
 
-    projectCols.push({
-      col: c,
-      projNum,
-      taskNum:      data[TASK_NUM_ROW][c],
-      workType:     data[WORK_TYPE_ROW][c],
-      personnelCode:data[RES_NUM_ROW][c],
-    });
-  }
-
-  Logger.log('🛈 Project columns found: %s', JSON.stringify(projectCols, null, 2));
-
-// ───── 2. Locate the two most‑recent END PERIOD rows *up to today* ────────────
-const today = new Date();
-
-// Gather every END PERIOD plus the date that precedes it (the period’s last work‑day)
-const endRows = [];
-data.forEach((row, idx) => {
-  if (String(row[0]).toUpperCase().trim() === 'END PERIOD') {
-    const prevDate = data[idx - 1]?.[0];            // date on the row just above
-    if (prevDate instanceof Date && prevDate <= today) {
-      endRows.push({ idx, prevDate });              // keep only “past” periods
+    if (projNumDisp || ['PTO (used)','PTU (used)','MBE'].includes(workType)) {
+      projectCols.push({
+        col: c,
+        projNumText: projNumDisp || '',          // always text, keeps 0‑padding
+        taskNum: display[TASK_NUM_ROW][c],
+        workType,
+        personnelCode: display[RES_NUM_ROW][c],
+      });
     }
   }
-});
+  if (!projectCols.length) return { periodEndDate:null, rows:[] };
 
-Logger.log('🛈 Eligible END PERIOD rows (≤ today): %s',
-           endRows.map(r => r.idx + 1));            // 1‑based for display
+  /* ---- completed END PERIOD range ---- */
+  const today   = new Date();
+  const endRows = [];
+  data.forEach((row, idx) => {
+    if (String(row[0]).toUpperCase().trim() === 'END PERIOD') {
+      const prevDate = data[idx - 1]?.[0];
+      if (prevDate instanceof Date && prevDate <= today) endRows.push({ idx, prevDate });
+    }
+  });
+  if (endRows.length < 2) return { periodEndDate:null, rows:[] };
 
-if (endRows.length < 2)
-  throw new Error('Need at least two completed pay periods before today.');
+  const lastEnd   = endRows[endRows.length - 1].idx;
+  const prevEnd   = endRows[endRows.length - 2].idx;
+  const firstData = prevEnd + 1;
+  const lastData  = lastEnd - 1;
+  const periodEndDate = data[lastData][0];
 
-const lastEnd   = endRows[endRows.length - 1].idx;  // zero‑based index
-const prevEnd   = endRows[endRows.length - 2].idx;
-const firstData = prevEnd + 1;
-const lastData  = lastEnd - 1;
-
-Logger.log('🛈 Prior (completed) period = sheet rows %s–%s',
-           firstData + 1, lastData + 1);            // 1‑based in log
-
-  // ───── 3. Build the output array ──────────────────────────────────────────────
+  /* ---- build export rows ---- */
   const [last, first] = ss.getName().split('_')[0].split('-');
   const personName    = `${last}, ${first}`;
 
-  const out = [['Work Date','Personnel Code','Person name','Hours',
-                'Project No.','Project Task No.','Work Type']];
-
+  const rows = [];
   for (let r = firstData; r <= lastData; r++) {
     const dateVal = data[r][0];
-    if (!(dateVal instanceof Date)) {
-      Logger.log('‑‑ Skipping row %s; A value = %s (type %s)',
-                 r + 1, dateVal, typeof dateVal);
-      continue;
-    }
+    if (!(dateVal instanceof Date)) continue;
 
     projectCols.forEach(p => {
-      const raw = data[r][p.col];
-      const hrs = raw === '' ? 0 : Number(raw);
-
-      if (hrs > 0) {
-        Logger.log('✔ Row %s | %s | Col %s → %s hrs',
-                   r + 1, Utilities.formatDate(dateVal, ss.getSpreadsheetTimeZone(), 'MM/dd'),
-                   p.col + 1, hrs);
-
-        out.push([
+      // ✔ keep minus sign, decimal; remove other junk
+      const numStr = String(data[r][p.col]).replace(/[^0-9.\-]/g, '');
+      const hrs    = parseFloat(numStr);
+      if (!isNaN(hrs) && hrs > 0) {                // skips zero or negative PTO/MBE
+        rows.push([
           dateVal,
           p.personnelCode,
           personName,
           hrs,
-          p.projNum,
+          "'" + p.projNumText,                     // leading apostrophe → force text
           p.taskNum,
-          p.workType
+          p.workType,
         ]);
       }
     });
   }
+  return { periodEndDate, rows };
+}
 
-  Logger.log('🛈 Total export rows (excluding header): %s', out.length - 1);
 
-  if (out.length === 1) throw new Error('No billable hours found in the prior pay period.');
+/**
+ * Find or create the Paylocity_YYYYMMDD file in the export folder.
+ * Keeps a cache to avoid reopening when multiple employees share the same period.
+ */
+function getPaylocitySheet(periodEndDate, cache) {
+  const fileName = 'Paylocity_' + Utilities.formatDate(
+    periodEndDate, Session.getScriptTimeZone(), 'yyyyMMdd');
 
-  // ───── 4. Create the new sheet & write data ───────────────────────────────────
-  const tz    = ss.getSpreadsheetTimeZone();
-  const stamp = Utilities.formatDate(new Date(), tz, 'yyyyMMdd_HHmm');
-  const newSS = SpreadsheetApp.create(`Palocity Export – ${personName} – ${stamp}`);
-  const tgt   = newSS.getActiveSheet();
+  if (cache.has(fileName)) return cache.get(fileName);
 
-  tgt.getRange(1,1,out.length,out[0].length).setValues(out);
-  tgt.getRange('A2:A').setNumberFormat('MM/dd/yyyy');
+  const folder = DriveApp.getFolderById(EXPORT_FOLDER_ID);
+  const files = folder.getFilesByName(fileName);
+  let ss, isNew = false;
 
-  try {
-    const parent = DriveApp.getFileById(ss.getId()).getParents().next();
-    DriveApp.getFileById(newSS.getId()).moveTo(parent);
-  } catch (e) {/* ignore if no parent folder */}
+  if (files.hasNext()) {
+    ss = SpreadsheetApp.open(files.next());
+  } else {
+    ss = SpreadsheetApp.create(fileName);
+    folder.addFile(DriveApp.getFileById(ss.getId()));          // move to folder
+    DriveApp.getRootFolder().removeFile(DriveApp.getFileById(ss.getId()));
+    isNew = true;
+  }
+  const sheet = ss.getSheets()[0];
+  if (isNew && sheet.getLastRow() === 0) {
+    sheet.appendRow(['Work Date', 'Personnel Code', 'Person name', 'Hours',
+      'Project No.', 'Project Task No.', 'Work Type']);
+    sheet.getRange('A2').setNumberFormat('MM/dd/yyyy');
+  }
+
+  const info = { ss, sheet };
+  cache.set(fileName, info);
+  return info;
+}
+
+/**
+ * Append rows to the Paylocity sheet; keeps date column formatted.
+ */
+function appendRows(sheet, rows) {
+  if (rows.length === 0) return;
+  const startRow = sheet.getLastRow() + 1;
+  sheet.getRange(startRow, 1, rows.length, rows[0].length).setValues(rows);
+  sheet.getRange(`A${startRow}:A${startRow + rows.length - 1}`)
+    .setNumberFormat('MM/dd/yyyy');
 }
